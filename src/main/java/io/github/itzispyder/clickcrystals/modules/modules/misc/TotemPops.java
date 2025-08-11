@@ -1,125 +1,138 @@
-package io.github.itzispyder.clickcrystals.modules.modules.misc;
+package dev.lvstrng.argon.module.modules.combat;
 
-import io.github.itzispyder.clickcrystals.events.EventHandler;
-import io.github.itzispyder.clickcrystals.events.Listener;
-import io.github.itzispyder.clickcrystals.events.events.networking.PacketReceiveEvent;
-import io.github.itzispyder.clickcrystals.modules.Categories;
-import io.github.itzispyder.clickcrystals.modules.Module;
-import io.github.itzispyder.clickcrystals.modules.ModuleSetting;
-import io.github.itzispyder.clickcrystals.modules.settings.BooleanSetting;
-import io.github.itzispyder.clickcrystals.modules.settings.SettingSection;
-import io.github.itzispyder.clickcrystals.modules.settings.StringSetting;
-import io.github.itzispyder.clickcrystals.util.StringUtils;
-import io.github.itzispyder.clickcrystals.util.minecraft.ChatUtils;
-import io.github.itzispyder.clickcrystals.util.minecraft.PlayerUtils;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.EntityStatuses;
-import net.minecraft.entity.EntityType;
-import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
+import dev.lvstrng.argon.event.events.TickListener;
+import dev.lvstrng.argon.module.Category;
+import dev.lvstrng.argon.module.Module;
+import dev.lvstrng.argon.module.setting.BooleanSetting;
+import dev.lvstrng.argon.module.setting.ModeSetting;
+import dev.lvstrng.argon.module.setting.NumberSetting;
+import dev.lvstrng.argon.utils.EncryptedString;
+import dev.lvstrng.argon.utils.FakeInvScreen;
+import dev.lvstrng.argon.utils.InventoryUtils;
+import dev.lvstrng.argon.utils.TimerUtils;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.screen.slot.SlotActionType;
 
-import java.util.HashMap;
-import java.util.Map;
 
-public class TotemPops extends Module implements Listener {
+public final class AutoInventoryTotem extends Module implements TickListener {
+	public enum Mode {
+		Blatant, Random
+	}
 
-    public final SettingSection general = getGeneralSection();
-    public final ModuleSetting<String> enemyPops = general.add(StringSetting.create()
-            .name("enemy-pop-message")
-            .description("Message sent when enemy pops, %pops% for count, %enemy% for their name")
-            .def("&8&oThe player &4%enemy%&8&o popped &7&o(&e%pops%&7&o) &8totems!")
-            .build()
-    );
-    public final ModuleSetting<String> enemyDeath = general.add(StringSetting.create()
-            .name("enemy-death-message")
-            .description("Message sent when enemy pops, %pops% for count, %enemy% for their name")
-            .def("&8&oThe player &4&n%enemy% &8&o died after popping &7&o(&e%pops%&7&o) &8totems!")
-            .build()
-    );
-    public final ModuleSetting<Boolean> highlightOwn = general.add(BooleanSetting.create()
-            .name("show-own")
-            .description("Toggle showing your own pops in chat")
-            .def(true)
-            .build()
-    );
-    public final ModuleSetting<String> ownName = general.add(StringSetting.create()
-            .name("own-pop-name")
-            .description("Want to replace your name with in pop messages? (%player% for own name)")
-            .def("&6&n%player%")
-            .build()
-    );
+	private final ModeSetting<Mode> mode = new ModeSetting<>(EncryptedString.of("Mode"), Mode.Blatant, Mode.class)
+			.setDescription(EncryptedString.of("Whether to randomize the toteming pattern or no"));
+	private final NumberSetting delay = new NumberSetting(EncryptedString.of("Delay"), 0, 20, 0, 1);
+	private final BooleanSetting hotbar = new BooleanSetting(EncryptedString.of("Hotbar"), true).setDescription(EncryptedString.of("Puts a totem in your hotbar as well, if enabled (Setting below will work if this is enabled)"));
+	private final NumberSetting totemSlot = new NumberSetting(EncryptedString.of("Totem Slot"), 1, 9, 1, 1)
+			.setDescription(EncryptedString.of("Your preferred totem slot"));
+	private final BooleanSetting autoSwitch = new BooleanSetting(EncryptedString.of("Auto Switch"), false)
+			.setDescription(EncryptedString.of("Switches to totem slot when going inside the inventory"));
+	private final BooleanSetting forceTotem = new BooleanSetting(EncryptedString.of("Force Totem"), false).setDescription(EncryptedString.of("Puts the totem in the slot, regardless if its space is taken up by something else"));
+	private final BooleanSetting autoOpen = new BooleanSetting(EncryptedString.of("Auto Open"), false)
+			.setDescription(EncryptedString.of("Automatically opens and closes the inventory for you"));
+	private final NumberSetting stayOpenFor = new NumberSetting(EncryptedString.of("Stay Open For"), 0, 20, 0, 1);
 
-    private static final Map<String,Integer> totemPops = new HashMap<>();
+	int clock = -1;
+	int closeClock = -1;
 
-    public TotemPops() {
-        super("totem-pops", Categories.MISC, "Send messages when a player pops their totem");
-        system.addListener(this);
-    }
+	TimerUtils openTimer = new TimerUtils();
+	TimerUtils closeTimer = new TimerUtils();
 
-    @Override
-    protected void onEnable() {
+	public AutoInventoryTotem() {
+		super(EncryptedString.of("Auto Inventory Totem"),
+				EncryptedString.of("Automatically equips a totem in your offhand and main hand if empty"),
+				-1,
+				Category.COMBAT);
+		addSettings(mode, delay, hotbar, totemSlot, autoSwitch, forceTotem, autoOpen, stayOpenFor);
+	}
 
-    }
+	@Override
+	public void onEnable() {
+		eventManager.add(TickListener.class, this);
+		clock = -1;
+		closeClock = -1;
+		super.onEnable();
+	}
 
-    @Override
-    protected void onDisable() {
+	@Override
+	public void onDisable() {
+		eventManager.remove(TickListener.class, this);
+		super.onDisable();
+	}
 
-    }
+	@Override
+	public void onTick() {
+		if (shouldOpenScreen() && autoOpen.getValue())
+			mc.setScreen(new FakeInvScreen(mc.player));
 
-    @EventHandler
-    private void onReceiveStatus(PacketReceiveEvent e) {
-        if (e.getPacket() instanceof EntityStatusS2CPacket packet) {
-            if (PlayerUtils.invalid())
-                return;
+		if (!(mc.currentScreen instanceof InventoryScreen || mc.currentScreen instanceof FakeInvScreen)) {
+			clock = -1;
+			closeClock = -1;
+			return;
+		}
 
-            var p = PlayerUtils.player();
-            final Entity ent = packet.getEntity(PlayerUtils.getWorld());
-            final int status = packet.getStatus();
+		if (clock == -1)
+			clock = delay.getValueInt();
 
-            if (ent == null) return;
-            if (ent.getType() != EntityType.PLAYER) return;
+		if (closeClock == -1)
+			closeClock = stayOpenFor.getValueInt();
 
-            String name = ent.getDisplayName().getString();
-            if (name.equals(p.getDisplayName().getString())) {
-                if (highlightOwn.getVal()) {
-                    name = StringUtils.color(ownName.getVal());
-                } else {
-                    return;
-                }
-            }
+		if (clock > 0)
+			clock--;
 
-            if (status == EntityStatuses.USE_TOTEM_OF_UNDYING) {
-                setPops(ent,getPops(ent) + 1);
+		PlayerInventory inventory = mc.player.getInventory();
 
-                if (isEnabled()) {
-                    ChatUtils.sendPrefixMessage(compilePopMsg(ent, name, enemyPops.getVal()));
-                }
-            }
-            else if (status == EntityStatuses.PLAY_DEATH_SOUND_OR_ADD_PROJECTILE_HIT_PARTICLES) {
-                if (isEnabled()) {
-                    ChatUtils.sendPrefixMessage(compilePopMsg(ent, name, enemyDeath.getVal()));
-                }
+		if (autoSwitch.getValue())
+			inventory.selectedSlot = totemSlot.getValueInt() - 1;
 
-                setPops(ent,0);
-            }
-        }
-    }
+		if (clock <= 0) {
+			if (inventory.offHand.get(0).getItem() != Items.TOTEM_OF_UNDYING) {
+				int slot = mode.isMode(Mode.Blatant) ? InventoryUtils.findTotemSlot() : InventoryUtils.findRandomTotemSlot();
 
-    private String compilePopMsg(Entity ent, String entName, String msg) {
-        return StringUtils.color(msg)
-                .replaceAll("%pops%", "" + getPops(ent))
-                .replaceAll("%enemy%", entName)
-                .replaceAll("%player%",mc.getSession().getUsername());
-    }
+				if (slot != -1) {
+					mc.interactionManager.clickSlot(((InventoryScreen) mc.currentScreen).getScreenHandler().syncId, slot, 40, SlotActionType.SWAP, mc.player);
+					return;
+				}
+			}
 
-    public int getPops(Entity ent) {
-        return getOrDefault(totemPops.get(ent.getDisplayName().getString()),0);
-    }
+			if(hotbar.getValue()) {
+				ItemStack mainHand = mc.player.getMainHandStack();
+				if (mainHand.isEmpty() || forceTotem.getValue() && mainHand.getItem() != Items.TOTEM_OF_UNDYING) {
+					int slot = mode.isMode(Mode.Blatant) ? InventoryUtils.findTotemSlot() : InventoryUtils.findRandomTotemSlot();
 
-    private void setPops(Entity ent, int pops) {
-        totemPops.put(ent.getDisplayName().getString(), pops);
-    }
+					if (slot != -1) {
+						mc.interactionManager.clickSlot(((InventoryScreen) mc.currentScreen).getScreenHandler().syncId, slot, inventory.selectedSlot, SlotActionType.SWAP, mc.player);
+						return;
+					}
+				}
+			}
 
-    private <T> T getOrDefault(T value, T def) {
-        return value != null ? value : def;
-    }
+
+			if (shouldCloseScreen() && autoOpen.getValue()) {
+				if (closeClock != 0) {
+					closeClock--;
+					return;
+				}
+
+				mc.currentScreen.close();
+				closeClock = stayOpenFor.getValueInt();
+			}
+		}
+	}
+
+	public boolean shouldCloseScreen() {
+		if(hotbar.getValue())
+			return (mc.player.getInventory().getStack(totemSlot.getValueInt() - 1).getItem() == Items.TOTEM_OF_UNDYING && mc.player.getOffHandStack().getItem() == Items.TOTEM_OF_UNDYING) && mc.currentScreen instanceof FakeInvScreen;
+		else return ( mc.player.getOffHandStack().getItem() == Items.TOTEM_OF_UNDYING) && mc.currentScreen instanceof FakeInvScreen;
+	}
+
+	public boolean shouldOpenScreen() {
+		if(hotbar.getValue())
+			return (mc.player.getOffHandStack().getItem() != Items.TOTEM_OF_UNDYING || mc.player.getInventory().getStack(totemSlot.getValueInt() - 1).getItem() != Items.TOTEM_OF_UNDYING)
+					&& !(mc.currentScreen instanceof FakeInvScreen) && InventoryUtils.countItemExceptHotbar(item -> item == Items.TOTEM_OF_UNDYING) != 0;
+		else return (mc.player.getOffHandStack().getItem() != Items.TOTEM_OF_UNDYING && !(mc.currentScreen instanceof FakeInvScreen) && InventoryUtils.countItemExceptHotbar(item -> item == Items.TOTEM_OF_UNDYING) != 0);
+	}
 }
